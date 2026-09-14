@@ -1,0 +1,5 @@
+# Keep the repository contents LF regardless of the checkout platform, so the
+# same scripts run on the Windows dev box and the Linux GPU host.
+* text=auto eol=lf
+*.png binary
+*.pt binary

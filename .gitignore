@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Captured tensors / large artifacts (kept on the GPU host, not in git)
+*.pt
+*.pth
+*.safetensors
+
+# Local editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Patch payloads generated for the remote apply_patch workflow
+*.patch
+capture*.jsonl
