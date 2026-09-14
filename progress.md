@@ -142,3 +142,39 @@
 - 最终（按整周期口径）replay 对**生产算子**的加速比：batch 64 下 L=4 2.21×、L=8 2.15×、**L=16 1.99×**；batch 16 下 L=16 1.52×。break-even 约在 batch 4；batch ≤2 时 replay 落后（0.75–0.91×），因为两边都是 launch/延迟受限，replay 还要多读一遍 ring。
 - 生产算子本身很强：batch 64 单层 157µs 对应约 815 GB/s，即 4090 峰值的 81%，所以 1.99× 是算法（搬运量）收益，不是测量假象。
 - 仍需在报告里声明的口径差异：replay 计时不含每 token 的预处理（q/k L2 归一化、门控计算、ring 追加），生产算子是内联做这些的。量级不大但必须写明。
+
+## Session 13 (2026-09-14): full-contract 口径 + 真实 trace 复核（① ②）
+
+- 新增 `prototype/qwen35_capture_raw.py`：重录 capture，保存**原始** `mixed_qkv`、`a`、`b`、
+  初始 state 与生产算子每步输出（之前那份 capture 存的是已归一化的 q/k 与已算好的 g/β，无法用于
+  full-contract）。产出 `/root/qwen35_capture_raw_p0.pt`（432MB，4096 步 × 4 层）。
+- kernel 侧新增 `_gdn_prep_fused_kernel`（一次 launch 完成 q/k L2 归一化 + 门控 + v 拷贝 + ring 追加），
+  语义与生产算子逐项对齐（L2 eps=1e-6、softplus 阈值 20.0、q 最后乘 K^-0.5 的等价形式）。
+- 新增 `benchmarks/kernels/bench_gdn_full_contract.py`：两边都从原始输入出发，同时输出
+  core 与 full-contract 两个数字。
+- 过程中修掉三个自己的 bug：2D 张量多传了一个 stride、参考解只给了 1 个 token 而 ring 有 window 个
+  （`run_kernel` 按 `q.shape[1]` 循环）、以及“生产算子一次只走一步”与参考解走整窗口的语义错配
+  （改为先把生产状态推进到窗口末尾再比较）。
+- 结果（batch 64）：core L=4/8/16 = 2.21×/2.15×/1.99×；**full-contract = 1.81×/1.79×/1.68×**。
+  prep 在 batch 64 约 18µs，且与 num_warps 无关（launch/延迟受限）。
+- **真实 trace 复核**：用 capture 驱动同一 harness，与合成输入几乎一致（batch 64：1.772/1.806/1.690 vs
+  1.805/1.791/1.677），“合成数据过于理想”的质疑排除。
+
+## Session 14 (2026-09-14): teacher forcing 数值验收（③）
+
+- 新增 `prototype/qwen35_teacher_forced.py`：强制 baseline 的 token 序列喂给所有臂，只比较分布。
+  实现要点：vLLM 贪心路径返回未修改 logits，`gather_logprobs` 同时给出 top-k 与"被采样 token"的
+  logprob，所以只需覆盖 `sampled_token_ids`，记录到的仍是模型给该 token 的真实概率。
+- **加了两道自检，第二道救了这个实验**：第一道"关闭 replay 时强制解码必须与 baseline 逐位一致"
+  在强制**完全没生效**时也会通过（确定性贪心重跑本来就一致），是假阳性；第二道"故意喂被破坏的
+  序列、引擎必须原样输出"抓到了它——探针显示真正被调用的是 `GPUModelRunner.sample`，
+  而 `Sampler.sample/forward` 根本没被执行。改用正确挂点后 `forcing_is_live=true`。
+- 结果（2048 步全部纳入统计，阈值预注册 p95 |Δlogprob| < 0.125）：
+  L=4 mean 0.0529 / p95 **0.2666**；L=8 mean 0.0377 / p95 **0.1863**；L=16 mean 0.0311 / p95 **0.1546**
+  —— **三个窗口都未通过**。而 128 token 时 L=4 是通过的（p95 0.042）。
+- 关键交叉验证：从 128→2048 token，flush 次数增加 16×，离线漂移律预测扰动增加 4×；实测 p95 从
+  0.042 涨到 0.267，同量级。**离线状态链与在线模型分布两条独立测量互相印证。**
+- 量级交代：平均扰动 0.031–0.053 nats ≈ 典型贪心 margin（中位数 3.5–4.75）的 1%，token 级行为大体保持，
+  但分布已被可测量地改变，不能称为无损替换。
+- 结论：当前 1 byte/element 方案的可用区间是**短/中上下文 + 高并发**；长上下文必须靠 Phase 15
+  （误差补偿 flush / 两级 checkpoint / 按层选格式 / 更大 L + ring 压缩）。

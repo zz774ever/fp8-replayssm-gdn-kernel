@@ -26,6 +26,11 @@ recurrent cache slot.
 | `kernel_final_cycle_tuned.log` | final sweep with tuned apply (whole-K chunk) and the cycle model | L=16: **2.07x** at batch 64, 1.55x at batch 16; L=32: 1.76x at batch 64 |
 | `vs_production_first_pass_with_harness_bug.log` | first production-baseline run; state `.clone()` was inside the timed closure | kept as evidence: it made our BF16 kernel look 2x slower than production |
 | `vs_production_final.log` | replay vs vLLM's production FLA operator, corrected harness | L=16: **1.99x** at batch 64, 1.52x at batch 16; break-even ~batch 4 |
+| `kernel_full_contract_synthetic.log` | full operator contract (q/k norm + gating + ring append on both sides), synthetic inputs | L=4/8/16 = **1.81x / 1.79x / 1.68x** at batch 64 |
+| `kernel_full_contract_realtrace.log` | same, driven by the real 4096-step capture | 1.772 / 1.806 / 1.690 at batch 64 -- matches synthetic within noise |
+| `kernel_prep_warps_sweep.log` | prep kernel warp sweep | prep is ~18 us at batch 64 and insensitive to warps (launch/latency bound) |
+| `teacher_forced_128_smoke.log` | teacher forcing, 128 steps, with both apparatus self-checks | L=4 passes the pre-registered bar (p95 4.2e-2); `forcing_is_live=true` |
+| `teacher_forced_2048_steps.log` | teacher forcing, 2048 steps, L=4/8/16 | **all three fail** p95 < 0.125 (0.267 / 0.186 / 0.155) |
 
 Analyze with `python tools/analyze_replay_ab.py results/<file>.log`.
 Long-horizon captures analyze with `python tools/analyze_drift_study.py results/<file>.log`.

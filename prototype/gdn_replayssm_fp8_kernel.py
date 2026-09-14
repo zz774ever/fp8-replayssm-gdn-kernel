@@ -444,6 +444,351 @@ def gdn_bf16_step(
 
 
 @triton.jit
+def _gdn_prep_fused_kernel(
+    mixed_qkv_ptr,
+    q_out_ptr,
+    k_ring_ptr,
+    v_ring_ptr,
+    g_ring_ptr,
+    beta_ring_ptr,
+    a_ptr,
+    b_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    pos_ptr,
+    stride_mixed_b,
+    stride_q_b,
+    stride_q_h,
+    stride_q_k,
+    stride_kr_b,
+    stride_kr_t,
+    stride_kr_h,
+    stride_kr_k,
+    stride_vr_b,
+    stride_vr_t,
+    stride_vr_h,
+    stride_vr_v,
+    stride_gr_b,
+    stride_gr_t,
+    stride_gr_h,
+    stride_a_b,
+    stride_a_h,
+    stride_b_b,
+    stride_b_h,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    QK_OFFSET: tl.constexpr,
+    BLOCK: tl.constexpr,
+    L2_EPS: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """One launch for the whole preparation: q/k norm, gating, ring append.
+
+    Programs ``[0, H)`` normalise and append q/k, programs ``[H, H + HV)``
+    compute the gating scalars and append v. Splitting this into two kernels
+    doubled the launch overhead, which dominated at small batch.
+    """
+    pid_b = tl.program_id(0)
+    pid = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    pos = tl.load(pos_ptr + pid_b).to(tl.int64)
+    row = pid_b * stride_mixed_b
+    if pid < H:
+        pid_h = pid
+        mask_k = offs < K
+        query = tl.load(
+            mixed_qkv_ptr + row + pid_h * K + offs, mask=mask_k, other=0.0
+        ).to(tl.float32)
+        key = tl.load(
+            mixed_qkv_ptr + row + H * K + pid_h * K + offs,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        query = query / tl.sqrt(tl.sum(query * query) + L2_EPS)
+        key = key / tl.sqrt(tl.sum(key * key) + L2_EPS)
+        tl.store(
+            q_out_ptr
+            + pid_b * stride_q_b
+            + pid_h * stride_q_h
+            + offs * stride_q_k,
+            query.to(q_out_ptr.dtype.element_ty),
+            mask=mask_k,
+        )
+        tl.store(
+            k_ring_ptr
+            + pid_b * stride_kr_b
+            + pos * stride_kr_t
+            + pid_h * stride_kr_h
+            + offs * stride_kr_k,
+            key.to(k_ring_ptr.dtype.element_ty),
+            mask=mask_k,
+        )
+    else:
+        pid_hv = pid - H
+        mask_v = offs < V
+        value = tl.load(
+            mixed_qkv_ptr + row + QK_OFFSET + pid_hv * V + offs,
+            mask=mask_v,
+            other=0.0,
+        )
+        tl.store(
+            v_ring_ptr
+            + pid_b * stride_vr_b
+            + pos * stride_vr_t
+            + pid_hv * stride_vr_h
+            + offs * stride_vr_v,
+            value,
+            mask=mask_v,
+        )
+        a_val = tl.load(a_ptr + pid_b * stride_a_b + pid_hv * stride_a_h).to(
+            tl.float32
+        )
+        b_val = tl.load(b_ptr + pid_b * stride_b_b + pid_hv * stride_b_h).to(
+            tl.float32
+        )
+        a_log_val = tl.load(a_log_ptr + pid_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias_ptr + pid_hv).to(tl.float32)
+        x = a_val + dt_bias_val
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        gate = -tl.exp(a_log_val) * softplus_x
+        beta = tl.sigmoid(b_val)
+        tl.store(
+            g_ring_ptr
+            + pid_b * stride_gr_b
+            + pos * stride_gr_t
+            + pid_hv * stride_gr_h,
+            gate.to(g_ring_ptr.dtype.element_ty),
+        )
+        tl.store(
+            beta_ring_ptr
+            + pid_b * stride_gr_b
+            + pos * stride_gr_t
+            + pid_hv * stride_gr_h,
+            beta.to(beta_ring_ptr.dtype.element_ty),
+        )
+
+
+@triton.jit
+def _gdn_prep_qk_kernel(
+    mixed_qkv_ptr,
+    q_out_ptr,
+    k_ring_ptr,
+    pos_ptr,
+    stride_mixed_b,
+    stride_q_b,
+    stride_q_h,
+    stride_q_k,
+    stride_kr_b,
+    stride_kr_t,
+    stride_kr_h,
+    stride_kr_k,
+    K: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    L2_EPS: tl.constexpr,
+):
+    """q/k L2 normalisation and ring append, matching the production semantics.
+
+    The production operator does ``x / sqrt(sum(x*x) + 1e-6)`` inline; a fair
+    full-contract comparison has to do the same work on the replay side, which
+    is what this kernel exists for.
+    """
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    pos = tl.load(pos_ptr + pid_b).to(tl.int64)
+    row = pid_b * stride_mixed_b
+    query = tl.load(
+        mixed_qkv_ptr + row + pid_h * K + offs_k, mask=mask_k, other=0.0
+    ).to(tl.float32)
+    key = tl.load(
+        mixed_qkv_ptr + row + H * K + pid_h * K + offs_k, mask=mask_k, other=0.0
+    ).to(tl.float32)
+    query = query / tl.sqrt(tl.sum(query * query) + L2_EPS)
+    key = key / tl.sqrt(tl.sum(key * key) + L2_EPS)
+    tl.store(
+        q_out_ptr
+        + pid_b * stride_q_b
+        + pid_h * stride_q_h
+        + offs_k * stride_q_k,
+        query.to(q_out_ptr.dtype.element_ty),
+        mask=mask_k,
+    )
+    tl.store(
+        k_ring_ptr
+        + pid_b * stride_kr_b
+        + pos * stride_kr_t
+        + pid_h * stride_kr_h
+        + offs_k * stride_kr_k,
+        key.to(k_ring_ptr.dtype.element_ty),
+        mask=mask_k,
+    )
+
+
+@triton.jit
+def _gdn_prep_gating_kernel(
+    mixed_qkv_ptr,
+    v_ring_ptr,
+    g_ring_ptr,
+    beta_ring_ptr,
+    a_ptr,
+    b_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    pos_ptr,
+    stride_mixed_b,
+    stride_vr_b,
+    stride_vr_t,
+    stride_vr_h,
+    stride_vr_v,
+    stride_gr_b,
+    stride_gr_t,
+    stride_gr_h,
+    stride_a_b,
+    stride_a_h,
+    stride_b_b,
+    stride_b_h,
+    V: tl.constexpr,
+    QK_OFFSET: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """Gating computation plus the value ring append."""
+    pid_b = tl.program_id(0)
+    pid_hv = tl.program_id(1)
+    offs_v = tl.arange(0, BLOCK_V)
+    mask_v = offs_v < V
+    pos = tl.load(pos_ptr + pid_b).to(tl.int64)
+    value = tl.load(
+        mixed_qkv_ptr
+        + pid_b * stride_mixed_b
+        + QK_OFFSET
+        + pid_hv * V
+        + offs_v,
+        mask=mask_v,
+        other=0.0,
+    )
+    tl.store(
+        v_ring_ptr
+        + pid_b * stride_vr_b
+        + pos * stride_vr_t
+        + pid_hv * stride_vr_h
+        + offs_v * stride_vr_v,
+        value,
+        mask=mask_v,
+    )
+    a_val = tl.load(a_ptr + pid_b * stride_a_b + pid_hv * stride_a_h).to(tl.float32)
+    b_val = tl.load(b_ptr + pid_b * stride_b_b + pid_hv * stride_b_h).to(tl.float32)
+    a_log_val = tl.load(a_log_ptr + pid_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias_ptr + pid_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    gate = -tl.exp(a_log_val) * softplus_x
+    beta = tl.sigmoid(b_val)
+    tl.store(
+        g_ring_ptr + pid_b * stride_gr_b + pos * stride_gr_t + pid_hv * stride_gr_h,
+        gate.to(g_ring_ptr.dtype.element_ty),
+    )
+    tl.store(
+        beta_ring_ptr
+        + pid_b * stride_gr_b
+        + pos * stride_gr_t
+        + pid_hv * stride_gr_h,
+        beta.to(beta_ring_ptr.dtype.element_ty),
+    )
+
+
+def gdn_prep_ring(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    pos: torch.Tensor,
+    q_out: torch.Tensor,
+    k_ring: torch.Tensor,
+    v_ring: torch.Tensor,
+    g_ring: torch.Tensor,
+    beta_ring: torch.Tensor,
+    num_warps: int = 1,
+    fused: bool = True,
+) -> None:
+    """Full-contract preparation: normalise q/k, compute gating, append to ring."""
+    batch = mixed_qkv.shape[0]
+    heads = q_out.shape[1]
+    key_dim = q_out.shape[2]
+    value_heads = v_ring.shape[2]
+    value_dim = v_ring.shape[3]
+    if fused:
+        _gdn_prep_fused_kernel[(batch, heads + value_heads)](
+            mixed_qkv,
+            q_out,
+            k_ring,
+            v_ring,
+            g_ring,
+            beta_ring,
+            a,
+            b,
+            a_log,
+            dt_bias,
+            pos,
+            mixed_qkv.stride(0),
+            *q_out.stride(),
+            *k_ring.stride(),
+            *v_ring.stride(),
+            *g_ring.stride(),
+            *a.stride(),
+            *b.stride(),
+            K=key_dim,
+            H=heads,
+            V=value_dim,
+            QK_OFFSET=2 * heads * key_dim,
+            BLOCK=triton.next_power_of_2(max(key_dim, value_dim)),
+            L2_EPS=1e-6,
+            SOFTPLUS_THRESHOLD=20.0,
+            num_warps=num_warps,
+        )
+        return
+    _gdn_prep_qk_kernel[(batch, heads)](
+        mixed_qkv,
+        q_out,
+        k_ring,
+        pos,
+        mixed_qkv.stride(0),
+        *q_out.stride(),
+        *k_ring.stride(),
+        K=key_dim,
+        H=heads,
+        BLOCK_K=triton.next_power_of_2(key_dim),
+        L2_EPS=1e-6,
+        num_warps=num_warps,
+    )
+    _gdn_prep_gating_kernel[(batch, value_heads)](
+        mixed_qkv,
+        v_ring,
+        g_ring,
+        beta_ring,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        pos,
+        mixed_qkv.stride(0),
+        *v_ring.stride(),
+        *g_ring.stride(),
+        *a.stride(),
+        *b.stride(),
+        V=value_dim,
+        QK_OFFSET=2 * heads * key_dim,
+        BLOCK_V=triton.next_power_of_2(value_dim),
+        SOFTPLUS_THRESHOLD=20.0,
+        num_warps=num_warps,
+    )
+
+
+@triton.jit
 def _gdn_replay_precompute_kernel(
     q_ptr,
     k_cache_ptr,

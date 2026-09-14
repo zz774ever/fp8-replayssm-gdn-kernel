@@ -15,7 +15,7 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | --- | --- |
 | full-precision replay 与逐 token 递推**完全等价** | 输出与末状态零误差 |
 | FP8 E4M3 + vblock(32 行 × 全 K) checkpoint 可用 | 单次状态重建误差 1.7–2.6% |
-| 融合 kernel 相对 **vLLM 生产算子**加速 | **L=16：1.99×、L=4：2.21×**（batch 64，稳态口径） |
+| 融合 kernel 相对 **vLLM 生产算子**加速 | core **L=16 1.99× / L=4 2.21×**；full-contract **1.68× / 1.81×**（batch 64） |
 | 状态搬运字节相对 BF16 读-改-写 | 2.76× 更少（L=16） |
 | 正确性（对 fp32 参考解） | 输出相对 L2 1.65e-3–1.70e-3 = bf16 舍入底噪 |
 
@@ -27,6 +27,7 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | "2× 显存"叙事**不成立** | L=16 时字节比 0.70×（≈1.4× 容量），要 4k 漂移 ≤5% 需 L≈160，ring 比状态还大 |
 | 常用 mitigation **无效** | Hadamard 旋转虽严格等变（1e-7）却使 readout 误差变差（9/12 组） |
 | 贪心 token 一致率**不能当验收指标** | bf16 logits 使 ~1.5% 的 decode 步为精确 tie，翻转与量化无关 |
+| **长上下文数值验收未通过** | teacher forcing @2048 token：p95 \|Δlogprob\| = 0.155–0.267 > 预注册阈值 0.125；@128 token 通过（0.042） |
 
 ## 关键数字
 
@@ -39,7 +40,17 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | --- | --- | --- | --- |
 | 4 | 1.18 | 1.11 | 1.01 |
 | 16 | 1.85 | 1.65 | 1.52 |
-| 64 | 2.21 | 2.15 | **1.99** |
+| 64 | **2.21** | **2.15** | **1.99** |
+
+**full-contract**（两边都做 q/k 归一化 + 门控 + ring 追加，即真正的算子对算子口径）：
+
+| batch | L=4 | L=8 | L=16 |
+| --- | --- | --- | --- |
+| 16 | 1.30 | 1.29 | 1.19 |
+| 32 | 1.55 | 1.55 | 1.44 |
+| 64 | **1.81** | **1.79** | **1.68** |
+
+用真实 capture 驱动同一 harness 复核（batch 64）：1.772 / 1.806 / 1.690，与合成输入一致。
 
 break-even 约在 batch 4；batch ≤2 时 replay 落后（0.75–0.91×），因为该规模下两条路径都是
 launch/延迟受限。生产算子本身达到 ~815 GB/s（4090 峰值的 81%），所以这是算法（搬运量）收益。

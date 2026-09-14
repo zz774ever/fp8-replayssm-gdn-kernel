@@ -266,3 +266,65 @@ The missing piece for a kernel-project claim: not "faster than a kernel I wrote"
 
 - The production operator is well optimised: 157 us for a batch-64 layer step implies ~815 GB/s, i.e. 81% of the 4090's peak, so the 1.99x is an algorithmic (traffic) win rather than a measurement artifact. Break-even is around batch 4; below batch 2 the replay loses (0.75-0.91x) because at that size both paths are launch/latency bound and replay pays for an extra round of ring reads.
 - Still excluded from the replay timing: the per-token prep (q/k L2 normalisation, gating, ring append) that the production operator performs inline. Its volume is small (4096 element-ops plus a 12.2 KB append per sequence per layer per token) but it must be stated as a caveat rather than silently omitted.
+
+## Full-contract benchmark and real-trace confirmation (2026-09-14)
+
+`benchmarks/kernels/bench_gdn_full_contract.py` closes the last fairness gap: both
+sides now start from raw `mixed_qkv` + `a`/`b` and both must perform q/k L2
+normalisation, gating and the state/ring write. The prep side is one fused Triton
+kernel (`_gdn_prep_fused_kernel`: programs `[0,H)` normalise and append q/k,
+programs `[H,H+HV)` compute gating and append v), matching the production
+semantics exactly (`eps = 1e-6`, `softplus` threshold 20.0).
+
+- Validation on the full contract: production vs fp32 reference 2.5e-3-4.6e-3,
+  replay-full vs production 3.8e-3-6.7e-3.
+- Speedups at batch 64: **core 2.21x / 2.15x / 1.99x** and **full-contract 1.81x /
+  1.79x / 1.68x** for L=4 / 8 / 16. The gap is the prep kernel: ~18 us at batch 64,
+  essentially independent of `num_warps` (1 vs 4 changes nothing), i.e. launch and
+  latency bound rather than bandwidth bound.
+- Break-even moves from about batch 4 (core) to batch 8-16 (full contract); below
+  batch 2 the replay loses because the prep launch is not amortised.
+- **Real-trace confirmation**: driving the same harness from the captured raw
+  inputs of a real 4096-step Qwen3.5 decode (`qwen35_capture_raw_p0.pt`) reproduces
+  the synthetic table within noise -- batch 64: L=4 1.772x, L=8 1.806x, L=16 1.690x
+  (synthetic: 1.805 / 1.791 / 1.677). This closes the "were your synthetic inputs
+  unrealistically favourable?" objection.
+
+## Teacher-forced numerical acceptance: long context FAILS the pre-registered bar (2026-09-14)
+
+`benchmarks/qwen35_teacher_forced.py` forces the baseline's token sequence into
+every arm so all arms see identical inputs, and reads back the logprob of that
+token plus the top-k alternatives. Two self-checks guard the apparatus, and both
+were necessary:
+
+1. Replay disabled + forced sequence must reproduce the baseline exactly. It did
+   (all deltas 0.0) -- **but this check passed even when forcing was completely
+   ineffective**, because a deterministic greedy re-run reproduces the baseline
+   anyway.
+2. Forcing must actually be live: force a deliberately corrupted sequence and
+   require the engine to emit exactly that sequence. This caught the first
+   attempt, where the hook was placed on `Sampler.sample` -- a method the engine
+   never calls (a probe showed `GPUModelRunner.sample` is the real entry point).
+
+Results (all 2048 forced steps; threshold pre-registered at p95 |delta logprob|
+< 0.125, one bf16 ulp):
+
+| L | mean abs dlogp | p95 abs dlogp | max | mean KL(top-k) | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 0.0529 | 0.2666 | 1.238 | 0.137 | fail |
+| 8 | 0.0377 | 0.1863 | 0.947 | 0.082 | fail |
+| 16 | 0.0311 | 0.1546 | 0.682 | 0.076 | fail |
+
+- The same apparatus at 128 tokens passes for L=4 (mean 7.5e-3, p95 4.2e-2), so
+  "below the model's own bf16 resolution" holds only for short contexts.
+- The growth matches the offline drift study's prediction: 128 -> 2048 tokens
+  multiplies the flush count by 16 and the predicted perturbation by 4; L=4's p95
+  went 0.042 -> 0.267, the same order. **Two independent measurement paths (offline
+  state chains and online model distributions) agree**, which is the strongest
+  internal consistency check the project has.
+- Magnitude in context: the mean perturbation 0.031-0.053 nats is about 1% of the
+  median greedy margin (3.5-4.75), so token-level behaviour is largely preserved;
+  the distribution is nonetheless measurably shifted and this cannot be called a
+  lossless substitution at long context.
+- Consequence: the current scheme's defensible operating envelope is short-to-mid
+  context + high concurrency. Long context needs the Phase 15 mitigations.
