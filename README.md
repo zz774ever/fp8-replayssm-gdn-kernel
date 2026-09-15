@@ -1,15 +1,15 @@
 # FP8 Recurrent-State Cache + ReplaySSM Kernel for Mamba-hybrid LLM decode
 
 面向 **Qwen3.5-4B（Mamba-hybrid，GDN 层）decode 的 FP8 recurrent-state 压缩与 replay 融合内核**，
-在单张 **RTX 4090** 上完成从数值参考实现、真实模型注入式验证、长序列误差寿命分析，到
-Triton kernel 实现与性能验证的完整闭环。
+ **RTX 4090** 
 
-动机来自 [vLLM issue #55196](https://github.com/vllm-project/vllm/issues/55196)：
+
+动机 [vLLM issue #55196](https://github.com/vllm-project/vllm/issues/55196)：
 hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的显存与带宽成为瓶颈。
 
-## 从哪里开始读
 
-| 你想知道 | 去看 |
+
+| 内容 | 文档 |
 | --- | --- |
 | **这个项目到底做了什么**（背景 / 术语 / 路线 / 实现 / 数据 / 决策 / 边界） | **[REPORT.md](REPORT.md)** ← 主文档，先读这个 |
 | 每份实验日志跑的是什么 | [results/README.md](results/README.md) |
@@ -17,14 +17,11 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | 当时的决策与踩过的坑 | [progress.md](progress.md)（按时间）、[task_plan.md](task_plan.md) |
 | 简历怎么写 / 面试怎么答 | [RESUME.md](RESUME.md) |
 
-**三十秒版本**：生产 GDN 算子已达 4090 峰值带宽的约 85%，所以不去优化它的写法，而是
-改变"状态必须被实体化并读写"这个前提——持久状态改为 **FP8 快照 + 最近 L 个 token 的输入**，
-当前输出用**反向低秩等价式**直接算出，完整状态每 L 步才重建一次。换来 full-contract
-**1.61–1.73×**，代价是容量只省约 30%，且长序列数值不达标。
+
 
 ## 结论摘要
 
-**做对了什么**
+
 
 | 结论 | 证据 |
 | --- | --- |
@@ -34,7 +31,7 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | 状态搬运字节相对 BF16 读-改-写 | 2.76× 更少（L=16） |
 | 正确性（对 fp32 参考解） | 输出相对 L2 1.65e-3–1.70e-3 = bf16 舍入底噪 |
 
-**做不到了什么（同样重要）**
+**缺点**
 
 | 结论 | 证据 |
 | --- | --- |
@@ -97,7 +94,7 @@ task_plan.md 阶段规划、决策与止损条件
 
 ## 复现
 
-**固化环境**（全部结果对应的精确版本）：
+**环境**：
 
 | 组件 | 版本 / 标识 |
 | --- | --- |
@@ -142,7 +139,7 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_teacher_forced.py --max
 因此本文性能数字仍是修正前那一次。复测只需：
 `python prototype/bench_gdn_full_contract.py --batches 64 --window 4,8,16`。
 
-## 方法学要点
+
 
 1. **不把量化误差和 replay 算法混在一起**：先证明 full-precision replay 等价，再引入 FP8。
 2. **控制臂**：所有 A/B 都带一个"checkpoint 完全精确"的对照，确保结论能归因。
