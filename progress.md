@@ -1,5 +1,9 @@
 # Progress
 
+> 本文是**按时间**的过程日志：每条记录里的数字以当时的测量为准，后续若有修正会另起一条记录说明。
+> **最终数字与证据以 [REPORT.md](REPORT.md) §6 为准**；重要修正见本文 Session 15/16
+> （计时口径与 full-contract 分母偏差）。
+
 ## Session 1
 - 初始化规划文件。
 - 确认工作区没有可直接修改的代码。
@@ -209,3 +213,34 @@
 **计时口径修正已提交但未复测**：给 `gdn_replay_fp8` / `gdn_replay_fp8_split` 增加外部 `out` 缓冲参数，
 并把 full-contract harness 的 per-step 切片与 `pos.fill_` 移出计时闭包。GPU 实例已关闭，
 因此所有性能数字仍是修正前那一次测量，已在 README/REPORT/RESUME 三处如实标注与复测命令。
+
+## Session 16 (2026-09-15): 文档重构 + 关键数字复核（发现并修正一处分母偏差）
+
+**文档重构**（目标是"拿到仓库就能看懂做了什么"）：
+
+- `REPORT.md` 重写为主文档：三十秒版本 → 背景与问题（含为什么这个数字决定路线）→ 术语与符号表
+  → **算子规格**（契约表、kernel 清单与 grid、四处实现约束、它不做什么）→ **技术路线**
+  （8 步，每步说明"为什么必须在这个位置"）→ 实现方法（执行路径 / 反向低秩推导 / 量化 ABI /
+  kernel 与 tiling / 模型级注入方法 / teacher forcing 方法）→ 关键数据（正确性 / core /
+  full-contract / 真实 trace / 带宽 / 漂移 / 格式对照 / teacher forcing / tie 统计）
+  → **证据索引**（结论 → 脚本 → 日志）→ 设计决策与被否证方案 → 边界与局限 → 复现 → 结论与后续。
+- `findings.md` 重写为**中文、按主题归并**（上游事实与接口 / 算法与实现 / 正确性 / 性能 /
+  长序列寿命 / 模型级验证 / 工程缺陷 / 环境版本），过程细节仍留在 `progress.md`。
+- `results/README.md` 重写为中文日志索引（每份日志跑了什么、结论是什么、哪些产物未入库）。
+- `README.md` 增加"从哪里开始读"导航与三十秒版本。
+
+**关键数字复核（这次复核抓到一处实质偏差）**：
+
+- 发现 `bench_gdn_full_contract.py` 的 `production_call()` 把
+  `mixed_qkv[:, position].reshape(...).contiguous()` 与 `a/b[:, position].contiguous()`
+  写在了**计时闭包内**，使**分母偏大约 6.5 µs（batch 64，随 batch 等比缩放）**，
+  原始 full-contract 比值因此偏高约 4%。
+- 用 `bench_gdn_vs_production.py` 的**干净口径**生产算子耗时（batch 64 ≈ 156.2 µs）
+  重算同一批数据：**full-contract 由 1.81/1.79/1.68 修正为 1.73/1.72/1.61**；
+  真实 trace 表由 1.77/1.81/1.69 修正为 1.70/1.72/1.61；break-even 由 batch 8–16 后移到 ~16。
+- 同时把生产算子的达成带宽从"815 GB/s（81%）"更正为 **857–862 GB/s（约 85%）**
+  —— 之前引用的 815–827 GB/s 其实是**自写同风格 BF16 kernel** 的数字（822–826 GB/s，约 82%），
+  两者相差约 4%，此前混用了。
+- core 表（2.21/2.15/1.99）出自不含该问题的脚本，**无需修正**。
+- 修正后的口径已提交（切片移出闭包 + replay kernel 增加外部 `out` 参数），但**未复测**
+  （GPU 实例已关闭）。README/REPORT/RESUME/results-README 四处均已标注修正过程与复测命令。

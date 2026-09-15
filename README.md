@@ -7,6 +7,21 @@ Triton kernel 实现与性能验证的完整闭环。
 动机来自 [vLLM issue #55196](https://github.com/vllm-project/vllm/issues/55196)：
 hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的显存与带宽成为瓶颈。
 
+## 从哪里开始读
+
+| 你想知道 | 去看 |
+| --- | --- |
+| **这个项目到底做了什么**（背景 / 术语 / 路线 / 实现 / 数据 / 决策 / 边界） | **[REPORT.md](REPORT.md)** ← 主文档，先读这个 |
+| 每份实验日志跑的是什么 | [results/README.md](results/README.md) |
+| 某个结论的完整证据 | [findings.md](findings.md)（按主题） |
+| 当时的决策与踩过的坑 | [progress.md](progress.md)（按时间）、[task_plan.md](task_plan.md) |
+| 简历怎么写 / 面试怎么答 | [RESUME.md](RESUME.md) |
+
+**三十秒版本**：生产 GDN 算子已达 4090 峰值带宽的约 85%，所以不去优化它的写法，而是
+改变"状态必须被实体化并读写"这个前提——持久状态改为 **FP8 快照 + 最近 L 个 token 的输入**，
+当前输出用**反向低秩等价式**直接算出，完整状态每 L 步才重建一次。换来 full-contract
+**1.61–1.73×**，代价是容量只省约 30%，且长序列数值不达标。
+
 ## 结论摘要
 
 **做对了什么**
@@ -15,7 +30,7 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | --- | --- |
 | full-precision replay 与逐 token 递推**完全等价** | 输出与末状态零误差 |
 | FP8 E4M3 + vblock(32 行 × 全 K) checkpoint 可用 | 单次状态重建误差 1.7–2.6% |
-| 融合 kernel 相对 **vLLM 生产算子**加速 | core **L=16 1.99× / L=4 2.21×**；full-contract **1.68× / 1.81×**（batch 64） |
+| 融合 kernel 相对 **vLLM 生产算子**加速 | core **L=16 1.99× / L=4 2.21×**；full-contract **1.61–1.73×**（batch 64） |
 | 状态搬运字节相对 BF16 读-改-写 | 2.76× 更少（L=16） |
 | 正确性（对 fp32 参考解） | 输出相对 L2 1.65e-3–1.70e-3 = bf16 舍入底噪 |
 
@@ -42,18 +57,21 @@ hybrid 模型的 mamba page 与 attention page 绑定，使 recurrent state 的�
 | 16 | 1.85 | 1.65 | 1.52 |
 | 64 | **2.21** | **2.15** | **1.99** |
 
-**full-contract**（两边都做 q/k 归一化 + 门控 + ring 追加，即真正的算子对算子口径）：
+**full-contract**（两边都做 q/k 归一化 + 门控 + ring 追加，即真正的算子对算子口径）。
+下表已按"干净的生产算子耗时"重算 —— 原脚本里生产算子那侧含一次闭包内 `contiguous()` 拷贝
+（batch 64 约 6.5 µs），会把比值抬高约 4%；修正过程见 [REPORT.md](REPORT.md) §6.2。
 
 | batch | L=4 | L=8 | L=16 |
 | --- | --- | --- | --- |
-| 16 | 1.30 | 1.29 | 1.19 |
-| 32 | 1.55 | 1.55 | 1.44 |
-| 64 | **1.81** | **1.79** | **1.68** |
+| 16 | 1.14 | 1.11 | 1.04 |
+| 32 | 1.42 | 1.43 | 1.33 |
+| 64 | **1.73** | **1.72** | **1.61** |
 
-用真实 capture 驱动同一 harness 复核（batch 64）：1.772 / 1.806 / 1.690，与合成输入一致。
+用真实 capture 驱动同一 harness 复核（batch 64，同样修正后）：**1.70 / 1.72 / 1.61**，与合成一致。
 
-break-even 约在 batch 4；batch ≤2 时 replay 落后（0.75–0.91×），因为该规模下两条路径都是
-launch/延迟受限。生产算子本身达到 ~815 GB/s（4090 峰值的 81%），所以这是算法（搬运量）收益。
+break-even：**core 约 batch 4、full-contract 约 batch 16**；batch ≤4 时 replay 落后
+（0.43–0.91×），因为该规模下两条路径都是 launch/延迟受限（prep 那一次固定 launch 摊不掉）。
+生产算子本身达到 **857–862 GB/s（4090 峰值的约 85%）**，所以这是算法（搬运量）收益，不是弱基线。
 
 ### 长序列误差寿命（4085 步真实 decode 输入）
 

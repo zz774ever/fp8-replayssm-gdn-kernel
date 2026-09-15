@@ -1,40 +1,41 @@
-# Model-level GDN replay A/B logs
+# 实验日志索引
 
-All logs are JSON lines emitted by `prototype/qwen35_replay_ab.py` and
-`prototype/qwen35_logprob_probe.py`, run on the RTX 4090 host (`gdn-remote`,
-worktree `/root/vllm-fp8-replayssm`, Qwen3.5-4B bf16, eager, `max_model_len=512`,
-greedy decoding). The harness drives the real decode path: replay output
-replaces `core_attn_out` and the reconstructed state is written back into the
-recurrent cache slot.
+本目录是**原始实验日志**（每行一条 JSON，或标准输出），全部由 `prototype/` 下的脚本产生。
+环境基线见 `REPORT.md` §10（RTX 4090 / vLLM `0.1.dev20944+g58ad1f3b8` /
+Qwen3.5-4B snapshot `851bf6e8…`）。分析命令见 `REPORT.md` 附录 C。
 
-| File | Setup | Headline result |
+## 日志与结论对照
+
+| 日志文件 | 跑了什么 | 结论 |
 | --- | --- | --- |
-| `ab_32token_L2L4L8.log` | 1 prompt, 32 tokens, FP8 vblock, L=2/4/8, all 24 GDN layers replayed | 32/32 tokens identical for every window; mean abs logprob delta 5.5e-4/5.6e-4/8.1e-4; state drift vs baseline 4.96%/3.76%/2.76% |
-| `ab_256token_L4L8L16.log` | 2 prompts, 256 tokens, L=4/8/16 | prompt 0 diverges at step 120 in all windows; prompt 1 keeps L=4 identical for 256 steps |
-| `ab_256token_none_vs_fp8_3prompts.log` | 3 prompts, adds the quantization-free control arm | exact arm and FP8 arms diverge at the *same* step (120 / 94), so divergence is not FP8-caused |
-| `ab_256token_none_vs_fp8_4prompts.log` | 4 prompts, per-step margins logged | all FP8 flips happen at contexts whose top-2 margin is 0.000 or 0.125 (bf16 ulp) |
-| `baseline_margin_probe.log` | unmodified model, 256 steps, top-5 alternatives dumped | 5 zero-margin steps out of 256; every reported margin is a multiple of 0.125 |
-| `drift_2048_vblock_L4L8L16.log` | capture 2048 real decode steps, offline exact-vs-FP8 chains | drift grows monotonically and does not saturate (`t^0.37`) |
-| `drift_4085_vblock32_L4L16L64.log` | capture 4085 real decode steps, vblock32, L=4/16/64 | per-flush injected error is ~1% for every window; drift ~ sqrt(flushes) |
-| `drift_4085_vblock32_rotatedK_L4L16L64.log` | same, stored in a Hadamard-rotated key basis | rotation is equivariant (1.6e-7) but makes readout drift worse; rejected |
-| `drift_4085_format_arms_L16L64.log` | same, vblock16 and INT8 at L=16/64 | block size is irrelevant (~1e-5); INT8 wins on layers 0/16/24 but loses on layer 8 |
-| `kernel_sweep_blockv_warps.log` | fused replay kernel vs BF16 read-update-write step, block_v x num_warps sweep, batch 1-64, L=4/8/16/32 | L=4: up to 2.21x; L=16: up to 1.48x at batch 64; break-even batch ~1/4/8/32 |
-| `kernel_sweep_v1_with_scale_bug.log` | same sweep before the per-row scale fix | kept as evidence: wide tiles silently used the wrong vblock scale (1.7e-3 -> 1.2e-2) |
-| `kernel_split_first_pass.log` | first two-stage (precompute + apply) attempt, before K-chunking the state readout | correct but no faster: apply still held a [128,128] fp32 tile |
-| `kernel_final_sweep_tiled_vs_split.log` | final sweep, tiled vs split at every cell | L=16: 1.50x tiled vs 1.77x split at batch 64; L=32: 1.02x vs 1.42x |
-| `kernel_cycle_model_first.log` | first run with the steady-state (ring grows 1..L) cycle model | cycle numbers are 10-15% better than the worst-case ring=L model |
-| `kernel_final_cycle_tuned.log` | final sweep with tuned apply (whole-K chunk) and the cycle model | L=16: **2.07x** at batch 64, 1.55x at batch 16; L=32: 1.76x at batch 64 |
-| `vs_production_first_pass_with_harness_bug.log` | first production-baseline run; state `.clone()` was inside the timed closure | kept as evidence: it made our BF16 kernel look 2x slower than production |
-| `vs_production_final.log` | replay vs vLLM's production FLA operator, corrected harness | L=16: **1.99x** at batch 64, 1.52x at batch 16; break-even ~batch 4 |
-| `kernel_full_contract_synthetic.log` | full operator contract (q/k norm + gating + ring append on both sides), synthetic inputs | L=4/8/16 = **1.81x / 1.79x / 1.68x** at batch 64 |
-| `kernel_full_contract_realtrace.log` | same, driven by the real 4096-step capture | 1.772 / 1.806 / 1.690 at batch 64 -- matches synthetic within noise |
-| `kernel_prep_warps_sweep.log` | prep kernel warp sweep | prep is ~18 us at batch 64 and insensitive to warps (launch/latency bound) |
-| `teacher_forced_128_smoke.log` | teacher forcing, 128 steps, with both apparatus self-checks | L=4 passes the pre-registered bar (p95 4.2e-2); `forcing_is_live=true` |
-| `teacher_forced_2048_steps.log` | teacher forcing, 2048 steps, L=4/8/16 | **all three fail** p95 < 0.125 (0.267 / 0.186 / 0.155) |
+| `ab_32token_L2L4L8.log` | 模型级 A/B，32 token，L=2/4/8，24 层全部 replay | 32/32 token 与 baseline 一致；写回逐位验证通过 |
+| `ab_256token_L4L8L16.log` | 同上拉到 256 token | prompt 0 三个窗口都在第 120 步发散；prompt 1 的 L=4 保持 256 步一致 |
+| `ab_256token_none_vs_fp8_3prompts.log` | 加入**无量化对照臂** | 精确臂与 FP8 臂**同一步**发散（120 / 94）→ 发散并非 FP8 造成 |
+| `ab_256token_none_vs_fp8_4prompts.log` | 4 prompt + 逐 step margin | 所有 FP8 翻转都发生在 margin 为 0 或 0.125 的步 |
+| `baseline_margin_probe.log` | 未修改模型 256 步的 top-5 备选 | 256 步中 5 步 margin 恰为 0；margin 取值恒为 0.125 的整数倍 |
+| `drift_2048_vblock_L4L8L16.log` | 录制 2048 步真实输入 + 离线精确链 vs 量化链 | 漂移单调增长、**不饱和**（约 t^0.37） |
+| `drift_4085_vblock32_L4L16L64.log` | 4085 步，vblock32，L=4/16/64 | 每次 flush 注入约 1%（与 L 无关）→ 漂移 ≈ 1%×√(flush 次数) |
+| `drift_4085_vblock32_rotatedK_L4L16L64.log` | 同上，状态存在 K 轴 Hadamard 旋转基下 | 旋转等变（1e-7）但 readout 漂移更差 → **否证** |
+| `drift_4085_format_arms_L16L64.log` | 同 capture，vblock16 与 INT8 | 块大小几乎无影响（约 1e-5）；INT8 在层 0/16/24 更好、层 8 更差 |
+| `kernel_sweep_blockv_warps.log` | replay kernel 对 BF16 读-改-写基线，block_v × warps 扫描 | L=4 最高 2.21×；L=16 最高 1.48×（拆分前）；break-even batch 1/4/8/32 |
+| `kernel_sweep_v1_with_scale_bug.log` | 同上，但**按行 scale 修正之前** | 保留为证据：宽 tile 误用首个 scale（1.7e-3 → 1.2e-2） |
+| `kernel_split_first_pass.log` | 两段式（预计算 + apply）首版，K 未分块 | 正确但无提速（apply 仍持 [128,128] fp32 tile） |
+| `kernel_final_sweep_tiled_vs_split.log` | 完整扫描：tiled vs split 逐格对比 | L=16：1.50×（tiled）vs 1.77×（split）；L=32：1.02× vs 1.42× |
+| `kernel_cycle_model_first.log` | 首次采用"按整周期摊销"口径 | 稳态口径比"每步满 ring"好 10–15% |
+| `kernel_final_cycle_tuned.log` | apply 调参后的最终 core 表 | L=16 **2.07×**、L=32 1.76×（batch 64，对同风格 BF16 基线） |
+| `vs_production_first_pass_with_harness_bug.log` | 首次对生产算子，但把 `clone()` 写在计时闭包内 | 保留为证据：使自研基线看起来慢 2× |
+| `vs_production_final.log` | 修正 harness 后对**生产算子** | L=4/8/16 = 2.21×/2.15×/1.99×（batch 64，core，稳态） |
+| `kernel_full_contract_synthetic.log` | full-contract（含 prep），合成输入 | 原始 1.81/1.79/1.68（batch 64）；因生产算子侧含闭包内拷贝，**修正后 1.73/1.72/1.61** |
+| `kernel_full_contract_realtrace.log` | 同上，用 4096 步真实 capture 驱动 | 原始 1.77/1.81/1.69；**修正后 1.70/1.72/1.61**——与合成一致 |
+| `kernel_prep_warps_sweep.log` | prep kernel 线程数扫描 | batch 64 约 18 µs，与 warps 无关（launch/延迟受限） |
+| `teacher_forced_128_smoke.log` | teacher forcing 装置自检（128 步） | `apparatus_ok` + `forcing_is_live` 均通过；L=4 p95 0.042（通过预算） |
+| `teacher_forced_2048_steps.log` | teacher forcing 正式验收（2048 步） | **L=4/8/16 全部未通过** 0.125 预算（p95 0.267/0.186/0.155） |
 
-Analyze with `python tools/analyze_replay_ab.py results/<file>.log`.
-Long-horizon captures analyze with `python tools/analyze_drift_study.py results/<file>.log`.
+## 未随仓库提供的产物
 
-The captured inputs themselves are on the server at `/root/qwen35_capture_p0.pt`
-(4085 steps x layers 0/8/16/24), so further format/window sweeps can be run with
-`--load-capture` without reloading the model.
+| 产物 | 大小 | 说明 |
+| --- | --- | --- |
+| `qwen35_capture_raw_p0.pt` | 432 MB | 4096 步真实 decode 的原始 `mixed_qkv`/`a`/`b`/初始 state/生产算子输出；由 `prototype/qwen35_capture_raw.py` 重新生成 |
+| `qwen35_capture_p0.pt` | 546 MB | 漂移研究用的已准备输入；由 `prototype/qwen35_drift_study.py --save-capture` 重新生成 |
+
+两者都是**可重新生成**的中间产物，因此不入库；脚本与参数见 `REPORT.md` §10。

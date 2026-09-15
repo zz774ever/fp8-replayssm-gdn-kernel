@@ -12,10 +12,11 @@
   **FP8 checkpoint + 短窗口 replay** 执行路径：用反向低秩等价式把每 token 的整块状态读-改-写
   替换为一次 checkpoint 读 + 输入 ring 读，仅在每 L 步 flush 时重建并重新量化状态；Triton 实现，
   含融合的 q/k L2 归一化 + 门控 + ring 追加预处理。
-- 以 **vLLM 实际运行的生产 GDN 算子**（FLA packed decode，实测已达 4090 峰值带宽的 81%、
-  815 GB/s）为基线，在同一 harness 内对比：完整算子口径 **full-contract 1.68–1.81×**
-  （batch 64，L=4/8/16），core 口径 1.99–2.21×，状态搬运量减少 **2.76×**；给出 batch × 窗口的
-  完整 Pareto 与 break-even（batch 8–16），并用 4096 步**真实 decode 输入**复现同一张表（1.69–1.81×）。
+- 以 **vLLM 实际运行的生产 GDN 算子**（FLA packed decode，实测已达 4090 峰值带宽的约 85%、
+  857–862 GB/s）为基线，在同一 harness 内对比：完整算子口径 **full-contract 1.61–1.73×**
+  （batch 64，L=4/8/16），core 口径 1.99–2.21×，状态搬运量减少约 2.8×；给出 batch × 窗口的
+  完整 Pareto 与 break-even（core 约 batch 4、full-contract 约 batch 16），并用 4096 步
+  **真实 decode 输入**复现同一张表（1.61–1.72×）。
 - 建立完整数值证据链：自写 FP32 recurrence 参考解证明 full-precision replay 与逐 token 递推
   **零误差**；用 4085 步真实 capture 做离线"精确链 vs 量化链"对照，得到漂移
   ≈ 1%×√(flush 次数) 的**不饱和累积律**，并据此反推容量-上下文的定量 Pareto
@@ -36,11 +37,11 @@
   low-rank identity turns the per-token full state read-modify-write into one checkpoint read plus
   an input-ring read, rebuilding and requantising the state only every L steps. Triton
   implementation with fused q/k L2 norm + gating + ring append.
-- Benchmarked against **vLLM's production GDN operator** (FLA packed decode, itself at 81% of the
-  4090's peak bandwidth / 815 GB/s) inside one harness: **1.68–1.81× full-operator-contract**
+- Benchmarked against **vLLM's production GDN operator** (FLA packed decode, itself at about 85% of
+  the 4090's peak bandwidth / 857-862 GB/s) inside one harness: **1.61-1.73x full-operator-contract**
   (batch 64, L=4/8/16; 1.99–2.21× core-only) with **2.76× less state traffic**, a full
   batch × window Pareto with break-even at batch 8–16, and the same table reproduced from a
-  4096-step **real decode capture** (1.69–1.81×).
+  4096-step **real decode capture** (1.61-1.72x).
 - Built the numerical evidence chain: an FP32 recurrence reference proving full-precision replay is
   exact; an offline exact-vs-quantised chain study over 4085 captured steps giving a
   **non-saturating drift law of ≈1% × sqrt(flushes)**, from which the capacity/context Pareto
@@ -63,7 +64,7 @@
 
 ## 面试会被追问的四点
 
-1. **1.8× 是不是弱基线？** 基线是生产算子而非自写 kernel，它已达 815 GB/s（峰值 81%）；
+1. **~1.7× 是不是弱基线？** 基线是生产算子而非自写 kernel，它已达 857–862 GB/s（峰值约 85%）；
    而且我一度让自研基线被低估 2×（计时闭包内算了分配开销），是自己发现并修掉的。
 2. **长上下文没过，方案是不是没用？** 不是——是把适用边界量化了：短序列可用、长序列不行，
    且失败趋势与完全独立的离线状态漂移测量一致（√flush 律）。
@@ -74,7 +75,14 @@
 
 ### 一个必须知道的未收尾项
 
-最后我修正了计时口径（replay kernel 增加外部 `out` 缓冲、per-step 切片移出计时闭包），
-**代码已提交但未复测**（GPU 实例已关闭），因此简历数字仍是修正前那一次测量。
-若被问到计时是否干净，诚实答法是：**"core 版是干净的；full-contract 那一版还残留 output 分配，
-我已修正代码但未复测。"**
+1. **core 数字（2.21 / 2.15 / 1.99）是干净测量**：来自 `bench_gdn_vs_production.py`，
+   该脚本的生产算子侧不含任何闭包内拷贝。
+2. **full-contract 数字经过一次分母修正**：原脚本把生产算子那侧的
+   `mixed_qkv[:, position].contiguous()` 写在计时闭包内（batch 64 约 6.5 µs），
+   使比值偏高约 4%（原始 1.81/1.79/1.68 → 修正后 **1.73/1.72/1.61**）。
+   修正方式是**同一批数据的干净分母重算**，不是重新测量。
+3. **修复后的计时口径尚未复测**（GPU 实例已关闭），复测只需：
+   `python prototype/bench_gdn_full_contract.py --batches 64 --window 4,8,16`。
+
+若被问到计时是否干净，诚实答法是：**"core 是干净测量；full-contract 我已发现并修正了分母偏差
+（用干净耗时重算了同一批数据），但修正后的口径还没有复跑。"**
