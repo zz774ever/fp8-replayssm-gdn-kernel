@@ -76,6 +76,53 @@ T ← exp(g_t)·(T − β_t·k_t·(k_tᵀT))        （从当前 token 反向递
 | 产出 | 正确性、注入式 A/B、长序列漂移、tie 归因、teacher forcing | **全部性能数字** |
 | 数据 | 真实模型与真实 decode trace | 合成（真实几何+真实衰减分布）与**真实 capture** 双跑 |
 
+### 3.4 算子规格
+
+本算子替换的是 **GDN decode 单步算子**，与生产路径的
+`fused_recurrent_gated_delta_rule_packed_decode` 处于**同一个调用位点、同一份输入输出契约**
+（模型级实验里就是直接替换该调用，因此它是可替换算子，不是外围脚本）。
+
+| 项 | 生产算子 | 本算子 |
+| --- | --- | --- |
+| 输入 | `mixed_qkv [B, 2HK+HVV]` 原始拼接 q\|k\|v；`a`/`b` 原始门控 `[B,HV]`；`A_log`/`dt_bias` `[HV]`；`scale` | **完全相同** |
+| 持久状态 | bf16 `[slots, HV, V, K]` 完整状态缓存 | **FP8 checkpoint `[B,HV,V,K]` + 每 32 行 FP16 scale + ring（归一化 k / v / g / β）+ pos / flush 元数据** |
+| 输出 | `out [B,1,HV,V]` | **完全相同** |
+| 每步是否写整块状态 | 是（读 1 MiB + 写 1 MiB / 层 / 序列） | **否**：只 append 12.2 KB 进 ring |
+| launch 结构 | 1 次 | prep 1 次 + replay 1 次（+ 每 L 步 1 次 flush） |
+
+**一次调用做三件事**
+
+```
+① prep  (每次)  原始 q|k|v, a, b
+                → q/k L2 归一化 x/√(Σx²+1e-6)、g = −exp(A_log)·softplus(a+dt_bias)、β = sigmoid(b)
+                → 归一化 k、v、g、β 写入 ring 的第 pos 槽
+② replay (每次) checkpoint(FP8) + ring → 反向低秩递推 → 直接输出（**不读、不写整块状态**）
+③ flush  (每 L) checkpoint 反量化 → 沿 ring 正向重建完整状态 → 按 32 行 amax 量化 → 回写 checkpoint，清空 ring
+```
+
+**kernel 清单**
+
+| kernel | grid | 职责 | num_warps |
+| --- | --- | --- | --- |
+| `_gdn_prep_fused_kernel` | `(B, H+HV)` | 前半 program 做 q/k 归一化并写 ring，后半做门控计算 + v 拷贝写 ring。**融合为单次 launch**，以对齐生产算子"一次 launch 做完"的工作曲线 | 1 |
+| `_gdn_replay_fp8_kernel`（非 flush） | `(B, HV, V/BLOCK_V)` | 读 FP8 checkpoint tile（**按行 gather scale** 反量化）→ 反向遍历 ring 累积输出 → `out += S·T` → 乘 `K^-0.5` 写出。**不写状态** | 4 |
+| 同一 kernel（flush 分支） | 同上，`BLOCK_V=32` | 正向重建状态 → 输出 → **重新量化并回写 checkpoint + scale**；用 per-batch `flush` 标志分叉 | 4 |
+| `_gdn_replay_precompute_kernel` + `_gdn_replay_apply_kernel` | `(B,HV)` + `(B,HV,V/BLOCK_V)` | 两段式：反向链每个 `(batch, value head)` 只算一次并落盘 `T` 与系数 `c_t=β_t(k_tᵀT_t)`；apply 只做 `out = Σ c_t·v_t + S₀@T`，checkpoint 可大块连续读 | 1 / 4 |
+| `_gdn_replay_precompute_grouped_kernel` | `(B, H)` | 一个 program 服务同一 key head 的全部 value head，省掉 k 重读。实测**无收益**，如实保留 | 1 |
+| `_gdn_bf16_step_kernel` | `(B,HV,V/BLOCK_V)` | 仅作同风格对照：读 bf16 状态 → 单步更新 → 写回 → 输出 | 4 |
+
+**几处必须写下来的实现约束**
+
+1. **scale 是每 32 行一个**：宽 tile 跨多个 band 时若只取首个 scale，输出误差从 1.7e-3 跳到 1.2e-2。
+   必须按行 `gather(offs_v // 32)`。该缺陷**只能靠对 fp32 参考解的正确性校验发现**。
+2. **两段式拆分的收益来自"让 T 离开寄存器"**：T 落到显存后，apply kernel 才能按 K 分块读 checkpoint；
+   而实测 K 分块 32/64/128 中**整块（128）最快**——说明收益来自拆分本身，而非缩小寄存器 tile
+   （这一点推翻了我最初"寄存器压力"的假设）。
+3. **replay 与 flush 的最优 tiling 不同**：replay 用 `BLOCK_V=64/128` 最快，而 flush 必须钉在
+   `BLOCK_V=32`（要按 32 行写 scale）。基准中两者分开计时、再按窗口摊销。
+4. **它不做什么**：不做 conv1d（在该算子之前）、不做输出门控（在其之后）、不涉及 attention 层，
+   也不管理 ring 的分配与生命周期（那属于框架侧）。
+
 ---
 
 ## 4. 结果
@@ -163,7 +210,10 @@ token 序列强制喂给所有臂，让它们看到完全相同的输入，只�
      实测第一次挂钩位置错误（`Sampler.sample` 根本没被调用），第一个自检**假阳性通过**，
      第二个自检把它抓了出来，随后改用 `GPUModelRunner.sample` 才正确。
 
-阈值**预先注册**为 **p95 |Δlogprob| < 0.125**（一个 bf16 ulp，即模型自身报告概率的分辨率）。
+阈值**预先注册**为 **p95 |Δlogprob| < 0.125**。该阈值的来源是经验观察：
+baseline 中 bf16 top-2 logit margin 以 **0.125 为主要离散粒度**（见 4.5 节）。
+它是一个**预注册的经验阈值**，不是"bf16 的 ulp"这类理论量——bf16 的 ulp 随指数变化，
+logit 的取整间距也不等价于 logprob 的固定间距。
 
 先做短序列（128 token）验证装置：
 
@@ -181,8 +231,7 @@ token 序列强制喂给所有臂，让它们看到完全相同的输入，只�
 
 **这是本次实验最重要的负结论**，必须如实记录：
 
-1. 三个窗口在 2048 token 上都**未通过**预注册阈值；误差随 L 增大单调下降，但没有一个落到
-   一个 bf16 ulp 以内。
+1. 三个窗口在 2048 token 上都**未通过**预注册阈值；误差随 L 增大单调下降，但没有一个落进该预算内。
 2. 128 token 时同一套装置是**通过**的（p95 0.042）。也就是说，"FP8 checkpoint 在模型分辨率
    以下"这个说法**只在短上下文成立**。
 3. 恶化趋势与第 4.3 节离线漂移研究的预测一致（漂移按 √(flush 次数) 增长）：从 128 到 2048 token，
@@ -191,8 +240,11 @@ token 序列强制喂给所有臂，让它们看到完全相同的输入，只�
 4. 绝对量级仍要交代清楚：平均扰动 0.031–0.053 nats 约等于典型贪心 margin（中位数 3.5–4.75）的 1%，
    所以 token 级行为大体保持；但分布已经被**可测量地**改变，不能称为无损替换。
 
-因此当前方案的适用面是：**短/中上下文 + 高并发**；长上下文需要 Phase 15 的误差补偿手段
-（误差补偿 flush、两级 checkpoint、按层选格式，或更大的 L 配合 ring 压缩）。
+**适用边界目前只被"钉在两点之间"**：128 token 通过、2048 token 不通过，
+两者之间的 256/512/1024 **尚未扫描**。因此本报告不使用"短/中上下文"这类未经测量的区间表述；
+可以说的是：短序列已验证可满足该误差预算，2k 不满足，边界在两者之间。
+要把长上下文变成可用区间，需要误差补偿手段（误差补偿 flush、两级 checkpoint、
+按层选格式，或更大的 L 配合 ring 压缩）。
 
 ### 4.5 评估方法学发现
 
@@ -232,28 +284,47 @@ token 序列强制喂给所有臂，让它们看到完全相同的输入，只�
 
 ## 7. 复现
 
-环境：RTX 4090 / CUDA 13.2 / Torch 2.13 / Triton 3.7.1 / Qwen3.5-4B / vLLM 源码 worktree + `.venv`。
+**固化环境**（本次全部结果对应的精确版本，便于日后回溯）：
+
+| 组件 | 版本 / 标识 |
+| --- | --- |
+| GPU | RTX 4090（SM89，24 GB，峰值带宽约 1008 GB/s），驱动 595.80 |
+| 系统 / CUDA | Ubuntu 22.04.5 / CUDA 13.2 |
+| PyTorch | 2.13.0+cu132 |
+| Triton | 3.7.1 |
+| FlashInfer | 0.6.18 |
+| vLLM | `0.1.dev20944+g58ad1f3b8`，commit `58ad1f3b8973b23943107b51230d594050b42ec3` |
+| 模型 | Qwen3.5-4B HF snapshot `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
+
+仓库里所有脚本位于 **`prototype/`**（kernel 侧脚本与模型级脚本放在同一目录，靠同目录 import 工作）。
+运行时需要把它们放进一个 vLLM 源码环境（即 kernel 侧脚本置于 `benchmarks/kernels/`、模型级脚本置于
+`benchmarks/`），并使用该环境的 Python（例如 `.venv/bin/python`）。
 
 ```bash
 # 算子正确性与对生产算子的性能（core）
-python benchmarks/kernels/bench_gdn_vs_production.py --batches 1,2,4,8,16,32,64 --window 4,8,16
+python prototype/bench_gdn_vs_production.py --batches 1,2,4,8,16,32,64 --window 4,8,16
 
 # full-contract（含 prep）：合成输入与真实 capture 双跑
-python benchmarks/kernels/bench_gdn_full_contract.py --batches 8,16,32,64 --window 4,8,16
-python benchmarks/kernels/bench_gdn_full_contract.py --batches 16,32,64 --window 4,8,16 \
+python prototype/bench_gdn_full_contract.py --batches 8,16,32,64 --window 4,8,16
+python prototype/bench_gdn_full_contract.py --batches 16,32,64 --window 4,8,16 \
     --capture /root/qwen35_capture_raw_p0.pt
 
-# 录制真实 decode 输入（供上面两条与漂移研究使用）
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_capture_raw.py --tokens 4096 --layers 0,8,16,24
+# 录制真实 decode 原始输入（供上面两条、漂移研究与 teacher forcing 使用）
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_capture_raw.py --tokens 4096 --layers 0,8,16,24
 
 # 长序列漂移研究（录一次，之后可离线反复扫描）
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_drift_study.py \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_drift_study.py \
     --tokens 4096 --layers 0,8,16,24 --windows 4,16,64 --save-capture drift.pt
 
 # 模型级注入式 A/B 与 teacher forcing
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_replay_ab.py --max-tokens 256 --windows 4,8,16
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_teacher_forced.py --max-tokens 2048 --windows 4,8,16
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_replay_ab.py --max-tokens 256 --windows 4,8,16
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_teacher_forced.py --max-tokens 2048 --windows 4,8,16
 ```
+
+**未复测项（如实声明）**：最后一次测量之后，我给 replay kernel 增加了外部输出的 `out` 参数、
+并把 per-step 切片与 `pos.fill_` 移出计时闭包，使 timed region 只含 operator launch。
+该修正**已提交但尚未复测**（GPU 实例已关闭），因此本文所有性能数字仍是修正前那一次测量。
+若要复测，只需：`python prototype/bench_gdn_full_contract.py --batches 64 --window 4,8,16`。
 
 日志分析：`tools/analyze_vs_production.py`、`tools/analyze_full_contract.py`、
 `tools/analyze_kernel_sweep.py`、`tools/analyze_drift_study.py`、`tools/analyze_replay_ab.py`。
@@ -265,7 +336,7 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_teacher_forced.py --ma
 在**一个已经跑到 4090 峰值带宽 81% 的生产 GDN 算子**面前，通过改变 recurrent state 的
 执行方式（FP8 checkpoint + 短窗口 replay）可以把单层单步时间降到
 **做同样工作量的 1/1.68～1/1.81**，状态搬运量减少 2.76×，并且数值偏差停留在
-模型自身的 bf16 分辨率之下。
+   上面这个预注册的误差预算之内。
 
 同时，长序列实验给出了一条清晰的边界：**1 byte/element 的 checkpoint 无法同时换取
 大容量与长上下文**。这既是本方案的适用范围，也是后续工作的起点

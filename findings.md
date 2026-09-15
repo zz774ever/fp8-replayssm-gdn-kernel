@@ -307,7 +307,10 @@ were necessary:
    never calls (a probe showed `GPUModelRunner.sample` is the real entry point).
 
 Results (all 2048 forced steps; threshold pre-registered at p95 |delta logprob|
-< 0.125, one bf16 ulp):
+< 0.125). The threshold is an *empirical* pre-registration whose basis is the
+observed 0.125 discretisation of bf16 top-2 logit margins, not a theoretical
+"one bf16 ulp" claim: bf16's ulp varies with the exponent, and a logit rounding
+step is not a fixed step in logprob.
 
 | L | mean abs dlogp | p95 abs dlogp | max | mean KL(top-k) | verdict |
 | --- | --- | --- | --- | --- | --- |

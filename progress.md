@@ -82,7 +82,9 @@
 
 - 归因跑：4 个 prompt × 256 token × {none, vblock} × {L=4, L=8}，并把每步 top-2 margin 写进日志；新增 `tools/analyze_replay_ab.py` 的 first-flip 归因（不再统计首次发散之后必然出现的连锁不一致）。
 - baseline 全部逐 token 可重复（max|Δlogprob| 恰为 0）；报告 margin 恒为 0.125 的整数倍，确认到达采样器的 logits 是 bf16。
-- zero-margin 步数：5/3/3/4（各 256 步），合计 15/1024 ≈ 1.5%；最小非零 margin 恰为 0.125（一个 bf16 ulp）。
+- zero-margin 步数：5/3/3/4（各 256 步），合计 15/1024 ≈ 1.5%；最小非零 margin 恰为 0.125 ——
+  即 bf16 top-2 logit margin 的主要离散粒度（注意：这是经验观察，不能说成"bf16 的 ulp"或
+  "logprob 的分辨率"，bf16 的 ulp 随指数变化且 logit 取整间距不等于 logprob 固定间距）。
 - 精确 replay 臂（checkpoint 不做任何量化）在 p0/p2/p3 分别于第 120/94/97 步发散，且全部落在 zero-margin 步；其发散前状态漂移仅 0.15–0.17%/步。p1 上 256 步完全不发散。
 - FP8 臂同 context 的平均 |Δlogprob| 为 0.0044–0.0138（精确臂 0.0039–0.0056），最大 0.076–0.184，仍远低于 margin 中位数（3.5–4.75）。
 - FP8 相对精确臂的首次翻转：p0 L4/L8 = 125；p1 L8 = 91（L4 全程不翻转）；p2 L4 = 113、L8 = 102；p3 L4 = 61、L8 = 97。这 7 次翻转所在 context 的报告 margin 全部是 0.000 或 0.125 —— bf16 分辨率下能表达的两个最小值。
@@ -178,3 +180,32 @@
   但分布已被可测量地改变，不能称为无损替换。
 - 结论：当前 1 byte/element 方案的可用区间是**短/中上下文 + 高并发**；长上下文必须靠 Phase 15
   （误差补偿 flush / 两级 checkpoint / 按层选格式 / 更大 L + ring 压缩）。
+
+## Session 15 (2026-09-15): 封板前的文档与口径清理
+
+按外部评审意见做了 6 处修正（全部为口径与文档质量，不含新算法）：
+
+1. **补上算子规格章节**（REPORT §3.4）：此前文档只有研究结论，**没有算子的契约表、kernel 清单、
+   grid/tiling、以及"它不做什么"**。现在补齐：输入/持久状态/输出/每步是否写整态的对照表、
+   5 个 kernel 的 grid 与职责、四处实现约束（按行 gather scale、拆分的真实收益来源、
+   replay 与 flush 最优 tiling 不同、边界声明）。
+2. **修掉 README 自相矛盾**：顶部已写最终结果，底部"已知局限/下一步"却仍写着"prep 未计入、
+   真实 capture 未接入、teacher forcing 未做"。现改为准确的局限（容量 ≤1.4×、边界只钉在
+   128/2048 两点、prep 固定开销、batch 复现方式、计时修正未复测）与面向未来的 Next steps
+   （误差补偿 checkpoint / 按层自适应格式 / 边界扫描 / 可选上游集成）。
+3. **修正复现路径**：文档里仍写 `benchmarks/...`（远端 worktree 布局），而公开仓库是
+   `prototype/...`。已全部改为 `prototype/`，并说明运行前需放入 vLLM 源码环境。
+4. **修正"0.125 = 一个 bf16 ulp"的不严谨表述**（涉及 REPORT/findings/progress/脚本 docstring 共 5 处）：
+   改为"预注册的**经验**阈值，依据是 baseline 中 bf16 top-2 logit margin 以 0.125 为主要离散粒度"，
+   并显式说明 bf16 的 ulp 随指数变化、logit 取整间距不等价于 logprob 固定间距。
+5. **撤回未测区间断言**：不再写"适用于短/中上下文"，改为"128 通过、2048 不通过，
+   中间的 256/512/1024 尚未扫描"。
+6. **固化版本**：README/REPORT 增加精确版本表（vLLM `0.1.dev20944+g58ad1f3b8` /
+   commit `58ad1f3b...`、Qwen3.5-4B snapshot `851bf6e8...`、Torch 2.13.0+cu132、Triton 3.7.1、
+   FlashInfer 0.6.18、驱动 595.80）。
+
+另新增 `RESUME.md`（中英双语简历表述定稿 + 不要写的清单 + 面试追问准备）。
+
+**计时口径修正已提交但未复测**：给 `gdn_replay_fp8` / `gdn_replay_fp8_split` 增加外部 `out` 缓冲参数，
+并把 full-contract harness 的 per-step 切片与 `pos.fill_` 移出计时闭包。GPU 实例已关闭，
+因此所有性能数字仍是修正前那一次测量，已在 README/REPORT/RESUME 三处如实标注与复测命令。

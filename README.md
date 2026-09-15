@@ -79,30 +79,50 @@ task_plan.md 阶段规划、决策与止损条件
 
 ## 复现
 
-环境：RTX 4090（SM89）、CUDA 13.2、Torch 2.13、Triton 3.7.1、
-Qwen3.5-4B（HF `Qwen/Qwen3.5-4B`）、vLLM 源码 worktree + `.venv`。
+**固化环境**（全部结果对应的精确版本）：
+
+| 组件 | 版本 / 标识 |
+| --- | --- |
+| GPU | RTX 4090（SM89，24 GB，峰值带宽约 1008 GB/s），驱动 595.80 |
+| 系统 / CUDA | Ubuntu 22.04.5 / CUDA 13.2 |
+| PyTorch / Triton / FlashInfer | 2.13.0+cu132 / 3.7.1 / 0.6.18 |
+| vLLM | `0.1.dev20944+g58ad1f3b8`，commit `58ad1f3b8973b23943107b51230d594050b42ec3` |
+| 模型 | Qwen3.5-4B HF snapshot `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
+
+所有脚本在 **`prototype/`**。运行前需要把它们放进一个 vLLM 源码环境
+（kernel 侧脚本放 `benchmarks/kernels/`、模型级脚本放 `benchmarks/`），并用该环境的 Python。
 
 ```bash
-# 1) kernel 正确性 + 对生产算子的性能对比（不需要加载模型）
-python benchmarks/kernels/bench_gdn_vs_production.py --batches 1,2,4,8,16,32,64 --window 4,8,16
+# 1) 算子正确性 + 对生产算子的性能（core，不需要加载模型）
+python prototype/bench_gdn_vs_production.py --batches 1,2,4,8,16,32,64 --window 4,8,16
 
-# 2) tiling / 窗口 / 分块扫描
-python benchmarks/kernels/bench_gdn_replayssm.py --batches 1,4,16,64 --window 4,8,16,32 --block-v 32,64,128
+# 2) full-contract（两边都做 q/k 归一化 + 门控 + ring 追加）
+python prototype/bench_gdn_full_contract.py --batches 8,16,32,64 --window 4,8,16
+python prototype/bench_gdn_full_contract.py --batches 16,32,64 --window 4,8,16 --capture capture_raw.pt
 
-# 3) 诊断（寄存器/占用率/纯流量上界）
-python benchmarks/kernels/bench_kernel_diag.py --window 16 --batch 64 --block-v 32,64,128
+# 3) tiling / 窗口 / 分块扫描与占用率诊断
+python prototype/bench_gdn_replayssm.py --batches 1,4,16,64 --window 4,8,16,32 --block-v 32,64,128
+python prototype/bench_kernel_diag.py --window 16 --batch 64 --block-v 32,64,128
 
-# 4) 长序列漂移研究（先录真实 decode 输入，再离线跑精确链与量化链）
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_drift_study.py \
-    --tokens 4096 --layers 0,8,16,24 --windows 4,16,64 --save-capture capture.pt
-python benchmarks/qwen35_drift_study.py --load-capture capture.pt --windows 4,16,64
+# 4) 真实 decode 输入录制 + 长序列漂移研究
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_capture_raw.py --tokens 4096 --layers 0,8,16,24
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_drift_study.py \
+    --tokens 4096 --layers 0,8,16,24 --windows 4,16,64 --save-capture drift.pt
+python prototype/qwen35_drift_study.py --load-capture drift.pt --windows 4,16,64
 
-# 5) 模型级注入式 A/B（把 replay 输出与重建状态写回真实 decode 路径）
-VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_replay_ab.py --max-tokens 256 --windows 4,8,16
+# 5) 模型级注入式 A/B 与 teacher forcing 数值验收
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_replay_ab.py --max-tokens 256 --windows 4,8,16
+VLLM_ENABLE_V1_MULTIPROCESSING=0 python prototype/qwen35_teacher_forced.py --max-tokens 2048 --windows 4,8,16
 ```
 
-日志分析：`python tools/analyze_kernel_sweep.py results/<log>`、
-`tools/analyze_vs_production.py`、`tools/analyze_drift_study.py`、`tools/analyze_replay_ab.py`。
+日志分析：`python tools/analyze_vs_production.py results/<log>`、
+`tools/analyze_full_contract.py`、`tools/analyze_kernel_sweep.py`、
+`tools/analyze_drift_study.py`、`tools/analyze_replay_ab.py`。
+
+**未复测项**：最后一次测量之后我修正了计时口径（给 replay kernel 增加外部 `out` 缓冲、
+把 per-step 切片移出计时闭包），代码已提交但**尚未复测**（GPU 实例已关闭）。
+因此本文性能数字仍是修正前那一次。复测只需：
+`python prototype/bench_gdn_full_contract.py --batches 64 --window 4,8,16`。
 
 ## 方法学要点
 
@@ -117,13 +137,19 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 python benchmarks/qwen35_replay_ab.py --max-tok
 ## 已知局限
 
 - **未集成 vLLM**：所有性能数字是单层、单次 decode step 的 kernel 级结果；端到端 tokens/s 未测。
-- replay 计时**不含**每 token 预处理（q/k L2 归一化、门控计算、ring 追加），生产算子是内联做这些的。
-- kernel 基准输入为合成数据（真实几何 + 真实衰减分布）；真实 capture 已录制但尚未接入该基准。
-- **L=16 的数值闸门未过**：只知道每层状态漂移，尚未换算成模型级 logprob 损失（需要 teacher forcing）。
+- **容量不是本项目的卖点**：L=16 时常驻字节为 bf16 状态的 0.70×（≈1.4× 容量），且长序列受漂移限制。
+- **数值适用边界只被钉在两点之间**：128 token 通过预注册误差预算，2048 token 不通过；
+  中间的 256/512/1024 **尚未扫描**（因此不使用"短/中上下文"这类未经测量的区间表述）。
+- **full-contract 的 prep 是固定开销**：batch 64 约 18 µs 且与线程数无关（launch/延迟受限），
+  未做进一步的 prep 融合。
+- **真实 trace 的 batch 复现方式**：capture 为 batch-1，真实数据跑时把一个真实窗口复制到 batch 维；
+  该 kernel 无数据相关分支，因此对计时不产生影响。
+- **最后一次计时口径修正尚未复测**（详见上节"未复测项"）。
 
 ## 下一步
 
-1. **teacher-forced 长上下文评估**：强制两臂走同一 token 轨迹并记录未修改 logits 的 top-k，
-   把"每层漂移"换算成模型级误差 —— 这是唯一能改变结论的实验。
-2. 用真实 capture 驱动 kernel 基准，消除"合成数据"质疑。
-3. 若 L=16 不达标：误差补偿 flush / 两级 checkpoint / 按层选格式（INT8 在部分层明显更优）。
+1. **误差补偿 checkpoint**：把量化残差以紧凑形式带进 ring（残差链是线性的，理论上可改变
+   √(flush 次数) 的累积律），这是唯一可能把长上下文拉回可用区间的方向。
+2. **按层自适应格式**：INT8 在部分层明显更优（层 0/16/24），层 8 相反；零字节成本的调优空间。
+3. **适用边界扫描**：补 256/512/1024 token，把"128 通过、2048 不通过"之间的边界测出来。
+4. **上游集成**（可选，超出当前算子范围）：allocator / paged-state / CUDA Graph。

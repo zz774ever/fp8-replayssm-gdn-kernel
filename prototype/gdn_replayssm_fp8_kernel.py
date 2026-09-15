@@ -353,17 +353,24 @@ def gdn_replay_fp8(
     flush: torch.Tensor,
     block_v: int = 32,
     num_warps: int = 4,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch, max_cache_len, heads, key_dim = k_cache.shape
     value_heads = v_cache.shape[2]
     value_dim = v_cache.shape[3]
     block_k = triton.next_power_of_2(key_dim)
-    output = torch.empty(
-        batch,
-        value_heads,
-        value_dim,
-        dtype=q.dtype,
-        device=q.device,
+    # Allow the caller to supply the output buffer so a benchmark's timed region
+    # contains only kernel launches, not allocator traffic.
+    output = (
+        torch.empty(
+            batch,
+            value_heads,
+            value_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        if out is None
+        else out
     )
     grid = (batch, value_heads, triton.cdiv(value_dim, block_v))
     _gdn_replay_fp8_kernel[grid](
@@ -1135,6 +1142,7 @@ def gdn_replay_fp8_split(
     block_kc: int = 128,
     precompute_grouped: bool = True,
     num_stages: int = 2,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Non-flush replay as precompute + streaming apply.
 
@@ -1147,8 +1155,14 @@ def gdn_replay_fp8_split(
     value_dim = v_cache.shape[3]
     block_k = triton.next_power_of_2(key_dim)
     group_size = value_heads // heads
-    output = torch.empty(
-        batch, value_heads, value_dim, dtype=q.dtype, device=q.device
+    # As above: an externally supplied output buffer keeps the timed path free of
+    # allocator work.
+    output = (
+        torch.empty(
+            batch, value_heads, value_dim, dtype=q.dtype, device=q.device
+        )
+        if out is None
+        else out
     )
     if group_size > 1 and precompute_grouped:
         _gdn_replay_precompute_grouped_kernel[(batch, heads)](

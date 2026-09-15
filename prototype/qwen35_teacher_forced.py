@@ -20,8 +20,10 @@ Self-check: with the replay arm disabled the forced run must reproduce the
 baseline's logprobs exactly. If it does not, the apparatus is broken and the
 numbers are meaningless.
 
-Acceptance threshold (pre-registered): p95 |delta logprob| < 0.125, i.e. one
-bf16 ulp -- the resolution at which the model itself reports probabilities.
+Acceptance threshold (pre-registered): p95 |delta logprob| < 0.125. The basis is
+empirical -- bf16 top-2 logit margins in the baseline cluster on 0.125 steps --
+and deliberately not phrased as "one bf16 ulp": a bf16 ulp varies with the
+exponent, and a logit rounding step is not a fixed step in logprob.
 """
 
 from __future__ import annotations
